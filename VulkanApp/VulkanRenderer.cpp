@@ -1,5 +1,5 @@
 #include "VulkanRenderer.h"
-
+//test git
 VulkanRenderer::VulkanRenderer()
 {
 }
@@ -382,8 +382,8 @@ bool VulkanRenderer::checkInstanceExtensionSupport(std::vector<const char*>* che
 		if (!hasExtension) {
 			return false;
 		}
-	}
 
+	}
 	return true;
 }
 
