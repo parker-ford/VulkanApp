@@ -21,6 +21,7 @@ int VulkanRenderer::init(GLFWwindow* newWindow)
 		createCommandPool();
 		createCommandBuffers();
 		recordCommands();
+		createSynchronization();
 	}
 	catch (const std::runtime_error& e) {
 		printf("ERROR: %s\n", e.what());
@@ -33,13 +34,62 @@ int VulkanRenderer::init(GLFWwindow* newWindow)
 
 void VulkanRenderer::draw()
 {
+	// --Get next image--
+	vkWaitForFences(mainDevice.logicalDevice, 1, &drawFences[currentFrame], VK_TRUE, std::numeric_limits<uint64_t>::max());
+	vkResetFences(mainDevice.logicalDevice, 1, &drawFences[currentFrame]);
 	//1. get the next available image to draw to and set something to signal when wer're finished with the image (semaphore)
+	uint32_t imageIndex;
+	vkAcquireNextImageKHR(mainDevice.logicalDevice, swapchain, std::numeric_limits<uint64_t>::max(), imageAvailable[currentFrame], VK_NULL_HANDLE, &imageIndex);
+
+
+	//--submit command buffer to render--
 	//2. submit command buffer to queue to be executed, make sure it waits for the image to be signlaed as available before drawing
+	VkSubmitInfo submitInfo = {};
+	submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+	submitInfo.waitSemaphoreCount = 1;
+	submitInfo.pWaitSemaphores = &imageAvailable[currentFrame];
+	VkPipelineStageFlags waitStages[] = {
+		VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+	};
+	submitInfo.pWaitDstStageMask = waitStages;									//stages to check semaphore at
+	submitInfo.commandBufferCount = 1;
+	submitInfo.pCommandBuffers = &commandBuffers[imageIndex];					//command buffer to submit
+	submitInfo.signalSemaphoreCount = 1;
+	submitInfo.pSignalSemaphores = &renderFinished[currentFrame];								//sempahore to signale when command buffer finsishes
+
+	//submit command buffer to queue
+	VkResult result = vkQueueSubmit(graphicsQueue, 1, &submitInfo, drawFences[currentFrame]);
+	if (result != VK_SUCCESS) {
+		throw std::runtime_error("failed to submit command buffer to queue");
+	}
+
+	//--Present rendered image to screen
 	//3. present image to screen when it has signalled finsished rendering
+	VkPresentInfoKHR presentInfo = {};
+	presentInfo.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+	presentInfo.waitSemaphoreCount = 1;
+	presentInfo.pWaitSemaphores = &renderFinished[currentFrame];
+	presentInfo.swapchainCount = 1;
+	presentInfo.pSwapchains = &swapchain;
+	presentInfo.pImageIndices = &imageIndex;
+
+	result = vkQueuePresentKHR(presentationQueue, &presentInfo);
+	if (result != VK_SUCCESS) {
+		throw std::runtime_error("Failed to present the image");
+	}
+
+	currentFrame = (currentFrame + 1) % MAX_FRAME_DRAWS;
 }
 
 void VulkanRenderer::cleanup()
 {
+	//wait until no actions being run before destroying
+	vkDeviceWaitIdle(mainDevice.logicalDevice);
+	for (size_t i = 0; i < MAX_FRAME_DRAWS; i++) {
+		vkDestroySemaphore(mainDevice.logicalDevice, renderFinished[i], nullptr);
+		vkDestroySemaphore(mainDevice.logicalDevice, imageAvailable[i], nullptr);
+		vkDestroyFence(mainDevice.logicalDevice, drawFences[i], nullptr);
+	}
 	vkDestroyCommandPool(mainDevice.logicalDevice, graphicsCommandPool, nullptr);
 	for (auto framebuffer : swapChainFramebuffers) {
 		vkDestroyFramebuffer(mainDevice.logicalDevice, framebuffer, nullptr);
@@ -391,9 +441,11 @@ void VulkanRenderer::createRenderPass()
 
 void VulkanRenderer::createGraphicsPipeline()
 {
+
 	//read in SPIR-V code of shaders
 	auto vertexShaderCode = readFile("Shaders/vert.spv");
 	auto fragmentShaderCode = readFile("Shaders/frag.spv");
+
 
 	//build shader modules to link to graphics pipeline
 	VkShaderModule vertexShaderModule = createShaderModule(vertexShaderCode);
@@ -475,14 +527,14 @@ void VulkanRenderer::createGraphicsPipeline()
 	rasterizerCreateInfo.polygonMode = VK_POLYGON_MODE_FILL;										//how polygons are filled(change for wireframe or points)(other than fill needs a gpu feature)
 	rasterizerCreateInfo.lineWidth = 1.0f;															//how thick lines should be when drawn(gpu feature)
 	rasterizerCreateInfo.cullMode = VK_CULL_MODE_BACK_BIT;											//which face of a trianlge to cull
-	rasterizerCreateInfo.frontFace = VK_FRONT_FACE_BEGIN_RANGE;										//winding to determine which side is front
+	rasterizerCreateInfo.frontFace = VK_FRONT_FACE_CLOCKWISE;										//winding to determine which side is front
 	rasterizerCreateInfo.depthBiasEnable = VK_FALSE;												//whether to add depth bias to fragments
 
 	//--multisampling--
 	VkPipelineMultisampleStateCreateInfo multisamplingCreateInfo = {};
 	multisamplingCreateInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
 	multisamplingCreateInfo.sampleShadingEnable = VK_FALSE;											//enable multisampling or not
-	multisamplingCreateInfo.rasterizationSamples = VK_SAMPLE_COUNT_16_BIT;							//number of samples per fragment
+	multisamplingCreateInfo.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;							//number of samples per fragment
 
 	//--blending--
 	//Blending decides how to belnd a new color being written to a fragment, with the old value
@@ -624,6 +676,31 @@ void VulkanRenderer::createCommandBuffers()
 	}
 }
 
+void VulkanRenderer::createSynchronization()
+{
+	imageAvailable.resize(MAX_FRAME_DRAWS);
+	renderFinished.resize(MAX_FRAME_DRAWS);
+	drawFences.resize(MAX_FRAME_DRAWS);
+
+	// semaphore creation information
+	VkSemaphoreCreateInfo semaphoreCreateInfo = {};
+	semaphoreCreateInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+
+	//fence creation information
+	VkFenceCreateInfo fenceCreateInfo = {};
+	fenceCreateInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+	fenceCreateInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+
+	for (size_t i = 0; i < MAX_FRAME_DRAWS; i++) {
+		if (vkCreateSemaphore(mainDevice.logicalDevice, &semaphoreCreateInfo, nullptr, &imageAvailable[i]) != VK_SUCCESS ||
+			vkCreateSemaphore(mainDevice.logicalDevice, &semaphoreCreateInfo, nullptr, &renderFinished[i]) != VK_SUCCESS ||
+			vkCreateFence(mainDevice.logicalDevice, &fenceCreateInfo, nullptr, &drawFences[i]) != VK_SUCCESS) {
+		
+			throw std::runtime_error("failed to create a semaphore or fence");
+		}
+	}
+}
+
 void VulkanRenderer::recordCommands()
 {
 	//information about how to begin each command buffer
@@ -642,7 +719,6 @@ void VulkanRenderer::recordCommands()
 	};
 	renderPassBeginInfo.pClearValues = clearValues;											//List of clear values (TODO: depth attachment clear value)
 	renderPassBeginInfo.clearValueCount = 1;
-	renderPassBeginInfo.framebuffer = 1;
 
 	for (size_t i = 0; i < commandBuffers.size(); i++) {
 
@@ -671,9 +747,6 @@ void VulkanRenderer::recordCommands()
 			throw std::runtime_error("Failed to stop recording a command buffer");
 		}
 	}
-
-
-
 }
 
 void VulkanRenderer::getPhysicalDevice()
@@ -981,6 +1054,7 @@ VkShaderModule VulkanRenderer::createShaderModule(const std::vector<char>& code)
 	shaderModuleCreateInfo.codeSize = code.size();
 	shaderModuleCreateInfo.pCode = reinterpret_cast<const uint32_t *> (code.data());
 
+
 	VkShaderModule shaderModule;
 	VkResult result = vkCreateShaderModule(mainDevice.logicalDevice, &shaderModuleCreateInfo, nullptr, &shaderModule);
 	if (result != VK_SUCCESS) {
@@ -995,8 +1069,8 @@ VKAPI_ATTR VkBool32 VKAPI_CALL VulkanRenderer::debugCallback(VkDebugUtilsMessage
 
 	//TODO: check if message is of some level of severity:
 	if (messageSeverity >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) {
-		std::cerr << "Validation layer: " << pCallbackData->pMessage << std::endl;
 		//Message is important enough to show
+		std::cerr << "Validation layer: " << pCallbackData->pMessage << std::endl;
 	}
 
 	return VK_FALSE;
